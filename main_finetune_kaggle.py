@@ -103,7 +103,7 @@ class KaggleGeographicalDataset(Dataset):
             image = self.transform(image)
         else:
             # Default preprocessing: resize, normalize, and convert to tensor
-            image = cv2.resize(image, (96, 96))  # Resize to 96x96 (SatMAE default)
+            image = cv2.resize(image, (224, 224))  # Resize to 96x96 (SatMAE default)
             image = image.astype(np.float32) / 255.0  # Normalize to [0, 1]
             image = torch.from_numpy(image).permute(2, 0, 1)  # HWC to CHW
         
@@ -122,11 +122,11 @@ def get_args_parser():
     parser.add_argument('--epochs', default=30, type=int)
 
     # Model parameters
-    parser.add_argument('--model_type', default='simple_cnn', choices=['group_c', 'vanilla'],
+    parser.add_argument('--model_type', default='group_c', choices=['group_c', 'vanilla'],
                         help='Model type to use')
     parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train (for SatMAE models)')
-    parser.add_argument('--input_size', default=96, type=int, help='images input size')
+    parser.add_argument('--input_size', default=224, type=int, help='images input size')
     parser.add_argument('--patch_size', default=8, type=int, help='patch embedding patch size')
     parser.add_argument('--drop_path', type=float, default=0.2, metavar='PCT', help='Drop path rate')
 
@@ -146,6 +146,7 @@ def get_args_parser():
 
     # Finetuning params
     parser.add_argument('--finetune', default=None, help='finetune from checkpoint')
+    parser.add_argument('--freeze_backbone', action='store_true', help='freeze all layers except the head/classifier')
     parser.add_argument('--global_pool', action='store_true')
     parser.set_defaults(global_pool=True)
 
@@ -496,17 +497,41 @@ def main(args):
             print(f"Checkpoint file {args.finetune} not found. Training from scratch.")
 
     model.to(device)
+    
+    # Freeze backbone if requested
+    if args.freeze_backbone:
+        print("Freezing backbone layers, only training the head/classifier...")
+        frozen_params = 0
+        trainable_params = 0
+        
+        for name, param in model.named_parameters():
+            # Keep head/classifier layers trainable
+            if any(head_name in name for head_name in ['head', 'classifier', 'fc']):
+                param.requires_grad = True
+                trainable_params += param.numel()
+                print(f"Keeping trainable: {name}")
+            else:
+                param.requires_grad = False
+                frozen_params += param.numel()
+        
+        print(f"Frozen parameters: {frozen_params / 1e6:.2f}M")
+        print(f"Trainable parameters: {trainable_params / 1e6:.2f}M")
+    
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Model = %s" % str(model))
     print('number of params (M): %.2f' % (n_parameters / 1.e6))
 
     # Build optimizer
-    if SATMAE_AVAILABLE :
-        # Use layer-wise learning rate decay for SatMAE models
+    if SATMAE_AVAILABLE and not args.freeze_backbone:
+        # Use layer-wise learning rate decay for SatMAE models (only when not freezing)
         param_groups = lrd.param_groups_lrd(model, args.weight_decay,
                                             no_weight_decay_list=model.no_weight_decay(),
                                             layer_decay=args.layer_decay)
         optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+    else:
+        # Simple optimizer for frozen backbone or non-SatMAE models
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
     # Setup criterion
     if mixup_fn is not None:
@@ -522,9 +547,7 @@ def main(args):
     lr_schedule = cosine_scheduler(
         args.lr, 1e-6, args.epochs, len(data_loader_train),
         warmup_epochs=args.warmup_epochs, start_warmup_value=1e-6
-    )
-
-    # Resume from checkpoint if specified
+    )    # Resume from checkpoint if specified
     start_epoch = args.start_epoch
     if args.resume:
         if os.path.exists(args.resume):
