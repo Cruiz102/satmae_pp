@@ -1,0 +1,15 @@
+timm=0.4.12
+torch
+opencv-python
+matplotlib
+numpy
+pandas
+seaborn
+tqdm
+torchvision
+scikit-learn
+kagglehub
+huggingface_hub
+albumentations
+transformers
+tensorboard
