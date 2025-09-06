@@ -375,7 +375,7 @@ def get_args_parser():
     p.add_argument("--eval_only", action="store_true", help="evaluation only")
 
     # HF (Hiera)
-    p.add_argument("--hf_ckpt", type=str, default="facebook/hiera-small-224-in1k-hf",
+    p.add_argument("--hf_ckpt", type=str, default="facebook/hiera-large-224-in1k-hf",
                    help="Hiera checkpoint from Hugging Face Hub")
 
     # Freezing
