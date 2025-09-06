@@ -91,7 +91,7 @@ class KaggleGeographicalDataset(Dataset):
             raise FileNotFoundError(f"Image not found: {img_path}")
         
         # Convert BGR to RGB
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         
         # Get label vector and convert to tensor
         label_str = self.data.iloc[idx]['Label Vector']
