@@ -7,10 +7,8 @@
 import argparse
 import ast
 import datetime
-import json
 import os
 import time
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -42,8 +40,8 @@ class KaggleGeographicalDataset(Dataset):
     def __init__(self, csv_file, images_dir, processor_name, image_size=224, augment=False):
         self.df = pd.read_csv(csv_file)
         self.images_dir = images_dir
-        self.augment = augment
         self.image_size = image_size
+        self.augment = augment
 
         self.processor = AutoImageProcessor.from_pretrained(
             processor_name,
@@ -109,14 +107,134 @@ class KaggleGeographicalDataset(Dataset):
 
     def __len__(self):
         return len(self.df)
+  # ---------------------------
+    # Aug helpers (NumPy/OpenCV)
+    # ---------------------------
+    def _hflip(self, img):
+        return np.ascontiguousarray(img[:, ::-1, :])
+
+    def _vflip(self, img):
+        return np.ascontiguousarray(img[::-1, :, :])
+
+    def _rot90k(self, img, k):
+        if k % 4 == 0:
+            return img
+        return np.ascontiguousarray(np.rot90(img, k).copy())
+
+    def _small_rotate(self, img, max_deg=15):
+        # random angle in [-max_deg, max_deg]
+        ang = (np.random.rand() * 2 - 1) * max_deg
+        h, w = img.shape[:2]
+        M = cv2.getRotationMatrix2D((w/2, h/2), ang, 1.0)
+        return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+
+    def _random_resized_crop(self, img, scale=(0.6, 1.0), ratio=(0.75, 1.33)):
+        h, w = img.shape[:2]
+        area = h * w
+        for _ in range(10):
+            target_area = np.random.uniform(*scale) * area
+            log_ratio = (np.log(ratio[0]), np.log(ratio[1]))
+            aspect = np.exp(np.random.uniform(*log_ratio))
+            new_w = int(round(np.sqrt(target_area * aspect)))
+            new_h = int(round(np.sqrt(target_area / aspect)))
+            if 0 < new_w <= w and 0 < new_h <= h:
+                x1 = np.random.randint(0, w - new_w + 1)
+                y1 = np.random.randint(0, h - new_h + 1)
+                crop = img[y1:y1+new_h, x1:x1+new_w]
+                return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+        # fallback: center crop to min side
+        min_side = min(h, w)
+        y1 = (h - min_side) // 2; x1 = (w - min_side) // 2
+        crop = img[y1:y1+min_side, x1:x1+min_side]
+        return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    def _color_jitter(self, img, br=0.2, ct=0.2, sat=0.2):
+        # brightness & contrast in RGB
+        img_f = img.astype(np.float32)
+        if br > 0:
+            factor = 1.0 + np.random.uniform(-br, br)
+            img_f = img_f * factor
+        if ct > 0:
+            mean = img_f.mean(axis=(0,1), keepdims=True)
+            factor = 1.0 + np.random.uniform(-ct, ct)
+            img_f = (img_f - mean) * factor + mean
+        img_f = np.clip(img_f, 0, 255)
+
+        # saturation via HSV
+        if sat > 0:
+            hsv = cv2.cvtColor(img_f.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+            s_factor = 1.0 + np.random.uniform(-sat, sat)
+            hsv[...,1] = np.clip(hsv[...,1] * s_factor, 0, 255)
+            img_f = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+
+        return np.clip(img_f, 0, 255).astype(np.uint8)
+
+    def _gaussian_blur(self, img, p=0.15):
+        if np.random.rand() < p:
+            # ksize odd
+            k = np.random.choice([3, 5])
+            return cv2.GaussianBlur(img, (k, k), 0)
+        return img
+
+    def _gaussian_noise(self, img, p=0.15, sigma=5.0):
+        if np.random.rand() < p:
+            noise = np.random.randn(*img.shape).astype(np.float32) * sigma
+            out = img.astype(np.float32) + noise
+            return np.clip(out, 0, 255).astype(np.uint8)
+        return img
+
+    def _random_erasing(self, img, p=0.2, area_ratio=(0.02, 0.12), min_aspect=0.3):
+        if np.random.rand() >= p:
+            return img
+        h, w = img.shape[:2]
+        area = h * w
+        for _ in range(10):
+            target = np.random.uniform(*area_ratio) * area
+            aspect = np.random.uniform(min_aspect, 1/min_aspect)
+            er_w = int(round(np.sqrt(target * aspect)))
+            er_h = int(round(np.sqrt(target / aspect)))
+            if er_w < w and er_h < h:
+                x1 = np.random.randint(0, w - er_w + 1)
+                y1 = np.random.randint(0, h - er_h + 1)
+                # fill with per-channel mean noise
+                fill = np.random.randint(0, 256, (er_h, er_w, 3), dtype=np.uint8)
+                img[y1:y1+er_h, x1:x1+er_w] = fill
+                return img
+        return img
 
     def _maybe_augment(self, img_rgb):
         if not self.augment:
             return img_rgb
-        # light augments that are safe for multi-label
+
+        # Order of ops: geo -> crop -> color -> blur/noise -> erase
         if np.random.rand() < 0.5:
-            img_rgb = np.ascontiguousarray(img_rgb[:, ::-1, :])
+            img_rgb = self._hflip(img_rgb)
+        if np.random.rand() < 0.5:
+            img_rgb = self._vflip(img_rgb)
+        # 0, 90, 180, 270° (satellite scenes are rotation invariant)
+        img_rgb = self._rot90k(img_rgb, np.random.randint(0, 4))
+
+        # small free-angle rotation with low prob (to avoid over-distortion)
+        if np.random.rand() < 0.3:
+            img_rgb = self._small_rotate(img_rgb, max_deg=15)
+
+        # random resized crop (keeps output size same after resize)
+        if np.random.rand() < 0.7:
+            img_rgb = self._random_resized_crop(img_rgb, scale=(0.6, 1.0), ratio=(0.75, 1.33))
+
+        # color jitter (mild by default)
+        if np.random.rand() < 0.8:
+            img_rgb = self._color_jitter(img_rgb, br=0.15, ct=0.15, sat=0.15)
+
+        # slight blur/noise occasionally
+        img_rgb = self._gaussian_blur(img_rgb, p=0.15)
+        img_rgb = self._gaussian_noise(img_rgb, p=0.15, sigma=5.0)
+
+        # random erasing (occlusions / clouds / missing tiles)
+        img_rgb = self._random_erasing(img_rgb, p=0.2, area_ratio=(0.02, 0.12), min_aspect=0.3)
+
         return img_rgb
+
 
     def __getitem__(self, idx):
         img_path = self.df.iloc[idx]["_resolved_path"]
@@ -243,7 +361,6 @@ def main():
     cudnn.benchmark = True
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
     train_csv = os.path.join(args.data_path, args.train_csv)
     val_csv = os.path.join(args.data_path, args.val_csv)
@@ -254,7 +371,7 @@ def main():
     print("Loading datasets...")
     train_ds = KaggleGeographicalDataset(
         train_csv, images_path, processor_name=args.model_id,
-        image_size=args.image_size, augment=True
+        image_size=args.image_size, augment=True,
     )
     val_ds = KaggleGeographicalDataset(
         val_csv, images_path, processor_name=args.model_id,
@@ -312,12 +429,11 @@ def main():
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
-    # NEW: per-class pos_weight & criterion (define BEFORE resume/eval)
+
     pos_weight = compute_pos_weight_from_csv(train_csv, device)
-    print("pos_weight:", pos_weight.detach().cpu().numpy())  # optional
+    print("pos_weight:", pos_weight.detach().cpu().numpy())  
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # Scaler (new API avoids deprecation warning)
     scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
 
     # I/O
