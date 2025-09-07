@@ -30,40 +30,6 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def find_images_path(args):
-    """Find the correct path for images."""
-    possible_paths = [os.path.join(args.data_path, args.images_dir)]
-
-    # If kaggle_path is provided, try that too
-    if getattr(args, "kaggle_path", None):
-        possible_paths.insert(0, os.path.join(args.kaggle_path, "images"))
-
-    # Also try common Kaggle cache locations
-    home_dir = os.path.expanduser("~")
-    kaggle_cache = os.path.join(home_dir, ".cache", "kagglehub")
-    if os.path.exists(kaggle_cache):
-        for root, dirs, _ in os.walk(kaggle_cache):
-            if "images" in dirs:
-                possible_paths.append(os.path.join(root, "images"))
-
-    for path in possible_paths:
-        if os.path.exists(path):
-            image_files = [
-                f for f in os.listdir(path)
-                if f.lower().endswith((".jpg", ".jpeg", ".png"))
-            ]
-            if len(image_files) > 0:
-                print(f"Found {len(image_files)} images in: {path}")
-                return path
-
-    print(f"Warning: No images found in any of these paths: {possible_paths}")
-    return os.path.join(args.data_path, args.images_dir)  # fallback
-
-
 # ---------------------------
 # Dataset (robust resolver)
 # ---------------------------
@@ -239,11 +205,9 @@ def compute_pos_weight_from_csv(train_csv_path: str, device: torch.device, eps: 
 def get_args():
     p = argparse.ArgumentParser("DINOv2 fine-tuning for Kaggle NASA Geographical Objects")
     # Data
-    p.add_argument("--data_path", type=str, default="/home/cesar/kickoff_material/kickoff_pack")
+    p.add_argument("--data_path", type=str, default="./")
     p.add_argument("--train_csv", type=str, default="data/train.csv")
     p.add_argument("--val_csv", type=str, default="data/val.csv")
-    p.add_argument("--images_dir", type=str, default="images")
-    p.add_argument("--kaggle_path", type=str, default=None)
     p.add_argument("--image_size", type=int, default=224)
     p.add_argument("--augment", action="store_true")
 
@@ -283,7 +247,7 @@ def main():
 
     train_csv = os.path.join(args.data_path, args.train_csv)
     val_csv = os.path.join(args.data_path, args.val_csv)
-    images_path = find_images_path(args)
+    images_path = os.path.join(os.path.expanduser("~"), ".cache", "kagglehub", "images")
     print(f"[Resolved] images_path = {images_path}")
 
     # Datasets
