@@ -168,14 +168,9 @@ class KaggleGeographicalDataset(Dataset):
         pixel_values = inputs["pixel_values"].squeeze(0)
         return pixel_values, label
 
-
-# ---------------------------
-# Train / Eval
-# ---------------------------
 @torch.no_grad()
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, criterion):
     model.eval()
-    criterion = nn.BCEWithLogitsLoss()
 
     total_loss = 0.0
     all_pred, all_true = [], []
@@ -201,11 +196,8 @@ def evaluate(model, dataloader, device):
 
     return {"loss": avg_loss, "f1_micro": f1_micro, "f1_macro": f1_macro}
 
-
-def train_one_epoch(model, dataloader, optimizer, scheduler, device, scaler):
+def train_one_epoch(model, dataloader, optimizer, scheduler, device, scaler, criterion):
     model.train()
-    criterion = nn.BCEWithLogitsLoss()
-
     seen = 0
     running = 0.0
 
@@ -228,6 +220,18 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, scaler):
 
     return running / max(seen, 1)
 
+# --- NEW: compute per-class pos_weight from TRAIN CSV ---
+def compute_pos_weight_from_csv(train_csv_path: str, device: torch.device, eps: float = 1e-6):
+    import ast, numpy as np, pandas as pd, torch
+    df = pd.read_csv(train_csv_path)
+    # Stack label vectors into an (N, C) matrix
+    Y = np.stack([np.array(ast.literal_eval(s), dtype=np.float32) for s in df["Label Vector"]])  # (N, C)
+    pos = Y.sum(axis=0)                     # positives per class
+    neg = Y.shape[0] - pos                  # negatives per class
+    pw = neg / (pos + eps)                  # ratio -> larger weight for rare classes
+    # (Optional) clamp huge values if you have classes with 0 positives
+    pw = np.clip(pw, 1.0, 100.0)
+    return torch.tensor(pw, dtype=torch.float32, device=device)
 
 # ---------------------------
 # Args / Main
@@ -244,7 +248,7 @@ def get_args():
     p.add_argument("--augment", action="store_true")
 
     # Model
-    p.add_argument("--model_id", type=str, default="facebook/dinov3-vit7b16-pretrain-lvd1689m")  # or dinov2-large
+    p.add_argument("--model_id", type=str, default="facebook/dinov2-base")  # or dinov2-large
     p.add_argument("--nb_classes", type=int, default=None)  # inferred if None
 
     # Train
@@ -319,12 +323,11 @@ def main():
         num_workers=args.num_workers, pin_memory=True
     )
 
-    # Model (multi-label)
     model = AutoModelForImageClassification.from_pretrained(
         args.model_id,
         num_labels=args.nb_classes,
         problem_type="multi_label_classification",
-        ignore_mismatched_sizes=True,  # replace classifier head
+        ignore_mismatched_sizes=True,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -345,13 +348,19 @@ def main():
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+    # NEW: per-class pos_weight & criterion (define BEFORE resume/eval)
+    pos_weight = compute_pos_weight_from_csv(train_csv, device)
+    print("pos_weight:", pos_weight.detach().cpu().numpy())  # optional
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    # Scaler (new API avoids deprecation warning)
+    scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
 
     # I/O
     os.makedirs(args.output_dir, exist_ok=True)
     log_writer = SummaryWriter(args.log_dir) if (args.log_dir and not args.eval_only) else None
 
-    # Resume
+    # Resume (optionally override pos_weight from checkpoint)
     start_epoch = 0
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
@@ -359,10 +368,13 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt.get("epoch", 0) + 1
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
+        if "pos_weight" in ckpt:
+            pos_weight = torch.tensor(ckpt["pos_weight"], dtype=torch.float32, device=device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     # Eval only
     if args.eval_only:
-        stats = evaluate(model, val_loader, device)
+        stats = evaluate(model, val_loader, device, criterion)
         print(f"[Eval] loss={stats['loss']:.4f} | f1_micro={stats['f1_micro']:.4f} | f1_macro={stats['f1_macro']:.4f}")
         return
 
@@ -372,8 +384,8 @@ def main():
     print(f"Start training for {args.epochs} epochs")
 
     for epoch in range(start_epoch, args.epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device, scaler)
-        val_stats = evaluate(model, val_loader, device)
+        train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device, scaler, criterion)
+        val_stats  = evaluate(model, val_loader, device, criterion)
 
         print(f"Epoch {epoch+1:03d}/{args.epochs:03d} | "
               f"train_loss={train_loss:.4f} | "
@@ -388,7 +400,7 @@ def main():
             log_writer.add_scalar("val/f1_macro", val_stats["f1_macro"], epoch)
             log_writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
 
-        # Save periodic checkpoints
+        # Save periodic checkpoints (SAVE pos_weight too)
         if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
             ckpt_path = os.path.join(args.output_dir, f"epoch_{epoch+1}.pt")
             torch.save({
@@ -396,6 +408,7 @@ def main():
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch,
                 "args": vars(args),
+                "pos_weight": pos_weight.detach().cpu().tolist(),  # NEW
             }, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
 
@@ -408,6 +421,7 @@ def main():
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch,
                 "args": vars(args),
+                "pos_weight": pos_weight.detach().cpu().tolist(),  # NEW
             }, best_path)
             print(f"New best F1_micro={best_f1:.4f} -> {best_path}")
 
